@@ -56,7 +56,7 @@ func TestRequeueAfter(t *testing.T) {
 		},
 	}
 	fakeDynClient := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), gvrToListKind, duckType)
-	scmConfig := generators.NewSCMConfig("", []string{""}, true, true, nil, true)
+	scmConfig := generators.NewSCMConfig("", []string{""}, true, true, false, 100, nil, true)
 	terminalGenerators := map[string]generators.Generator{
 		"List":                    generators.NewListGenerator(),
 		"Clusters":                generators.NewClusterGenerator(ctx, k8sClient, appClientset, "argocd"),
