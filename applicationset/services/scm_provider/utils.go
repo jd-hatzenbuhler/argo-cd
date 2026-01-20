@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	argoprojiov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 )
@@ -138,12 +139,27 @@ func ListRepos(ctx context.Context, provider SCMProviderService, filters []argop
 
 func getBranches(ctx context.Context, provider SCMProviderService, repos []*Repository, compiledFilters []*Filter) ([]*Repository, error) {
 	reposWithBranches := []*Repository{}
-	for _, repo := range repos {
-		reposFilled, err := provider.GetBranches(ctx, repo)
-		if err != nil {
-			return nil, err
+	reposGetBranchesResult := make([][]*Repository, len(repos))
+	errorGetBranchesResult := make([]error, len(repos))
+	var wg sync.WaitGroup
+	wg.Add(len(repos))
+	for i, repo := range repos {
+		go func(i int, repo *Repository) {
+			defer wg.Done()
+			reposFilled, err := provider.GetBranches(ctx, repo)
+			if err != nil {
+				errorGetBranchesResult[i] = err
+			} else {
+				reposGetBranchesResult[i] = reposFilled
+			}
+		}(i, repo)
+	}
+	wg.Wait()
+	for i, errPtr := range errorGetBranchesResult {
+		if errPtr != nil {
+			return nil, errPtr
 		}
-		reposWithBranches = append(reposWithBranches, reposFilled...)
+		reposWithBranches = append(reposWithBranches, reposGetBranchesResult[i]...)
 	}
 	branchFilters := getApplicableFilters(compiledFilters)[FilterTypeBranch]
 	if len(branchFilters) == 0 {
