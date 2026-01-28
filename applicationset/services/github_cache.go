@@ -128,6 +128,12 @@ type Storage struct {
 	lruMap *lru.Cache
 }
 
+type cachedResponse struct {
+	varyHeaders      []string
+	varyHeadersValue map[string]string
+	responseBytes    []byte
+}
+
 func (s Storage) Get(_ context.Context, req *http.Request) (*http.Response, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
@@ -136,25 +142,43 @@ func (s Storage) Get(_ context.Context, req *http.Request) (*http.Response, erro
 	if !ok {
 		return nil, nil
 	}
-	valueBytes, ok := value.([]byte)
+	cachedResp, ok := value.(cachedResponse)
 	if !ok {
-		return nil, errors.New("value is not a []byte")
+		return nil, errors.New("value is not a cachedResponse")
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(valueBytes)), nil)
+	if !isSameVaryHeader(req, cachedResp.varyHeaders, cachedResp.varyHeadersValue) {
+		return nil, nil
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(cachedResp.responseBytes)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("http.ReadResponse failed: %w", err)
 	}
 	return resp, nil
 }
 
-func (s Storage) Put(_ context.Context, resp *http.Response) error {
+func (s Storage) Put(_ context.Context, req *http.Request, resp *http.Response) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	value, err := httputil.DumpResponse(resp, true)
 	if err != nil {
 		return fmt.Errorf("httputil.DumpResponse failed: %w", err)
 	}
-	s.lruMap.Add(resp.Request.URL.String(), value)
+	varyHeaders, err := parseVaryHeaders(resp.Header)
+	if err != nil {
+		// we cannot cache due to wildcard Vary header
+		return nil
+	}
+	varyHeadersValue := map[string]string{}
+	for _, header := range varyHeaders {
+		val := req.Header.Get(header)
+		if val != "" {
+			if header == "Authorization" {
+				val = gh_hash_token.HashToken(val) // Don't leak/cache the raw authentication token
+			}
+			varyHeadersValue[header] = val
+		}
+	}
+	s.lruMap.Add(resp.Request.URL.String(), cachedResponse{responseBytes: value, varyHeaders: varyHeaders, varyHeadersValue: varyHeadersValue})
 	globalGitHubStorageMetrics.StorageItemsTotal.WithLabelValues(s.key).Set(float64(s.lruMap.Len()))
 	return nil
 }
@@ -247,19 +271,15 @@ func parseVaryHeaders(headers http.Header) ([]string, error) {
 	return result, nil
 }
 
-func isSameVaryHeader(req *http.Request, resp *http.Response) bool {
-	varyHeaders, err := parseVaryHeaders(resp.Header)
-	if err != nil {
-		return false
-	}
+func isSameVaryHeader(req *http.Request, varyHeaders []string, varyHeadersValue map[string]string) bool {
 	// Check if the hashed_token and Accept headers are the same
 	for _, header := range varyHeaders {
 		if header == "Authorization" {
-			if gh_hash_token.HashToken(req.Header.Get(header)) != resp.Header.Get("X-Varied-"+header) {
+			if gh_hash_token.HashToken(req.Header.Get(header)) != varyHeadersValue[header] {
 				return false
 			}
 		} else {
-			if req.Header.Get(header) != resp.Header.Get("X-Varied-"+header) {
+			if req.Header.Get(header) != varyHeadersValue[header] {
 				return false
 			}
 		}
@@ -267,27 +287,12 @@ func isSameVaryHeader(req *http.Request, resp *http.Response) bool {
 	return true
 }
 
-func (t *GitHubCacheTransport) injectEtagHeader(req *http.Request, cached *http.Response) {
-	// If we have no cached response, bail, nothing to do
-	if cached == nil {
-		return
-	}
-
-	// If we're using the same header, we can directly use the cached etag
-	if isSameVaryHeader(req, cached) {
-		req.Header.Set("If-None-Match", cached.Header.Get("Etag"))
-		return
-	}
-	// If we're not using the cached response, ensure we close the body
-	_, _ = io.Copy(io.Discard, cached.Body)
-	_ = cached.Body.Close()
-}
-
 func (t *GitHubCacheTransport) RoundTrip(req *http.Request) (resp *http.Response, _ error) {
 	// If the request is not cacheable, just pass it through to the parent RoundTripper
 	if !cacheable(req) {
 		return t.parent.RoundTrip(req)
 	}
+	globalGitHubCacheMetrics.CacheRequestTotal.WithLabelValues(t.storage.key).Inc()
 
 	// Attempt to fetch from storage
 	cached, err := t.storage.Get(req.Context(), req)
@@ -305,12 +310,9 @@ func (t *GitHubCacheTransport) RoundTrip(req *http.Request) (resp *http.Response
 	// Per the http.RoundTripper contract, we cannot modify the request in-place, we need to shallow clone it
 	req = req.Clone(req.Context())
 
-	// Inject the conditional headers to the request
-	t.injectEtagHeader(req, cached)
-
 	if cached != nil {
-		// We attempted to use a cached response
-		globalGitHubCacheMetrics.CacheRequestTotal.WithLabelValues(t.storage.key).Inc()
+		// Inject the conditional headers to the request
+		req.Header.Set("If-None-Match", cached.Header.Get("Etag"))
 	}
 
 	// Perform the upstream request
@@ -333,9 +335,6 @@ func (t *GitHubCacheTransport) RoundTrip(req *http.Request) (resp *http.Response
 
 		// Copy in any cached headers that are not already set
 		for key, vals := range cached.Header {
-			if strings.HasPrefix(key, "X-Varied-") {
-				continue // Skip the X-Varied-* headers, they are "internal" to the cache
-			}
 			if _, ok := resp.Header[key]; !ok {
 				resp.Header[key] = vals
 			}
@@ -358,24 +357,15 @@ func (t *GitHubCacheTransport) RoundTrip(req *http.Request) (resp *http.Response
 		cacheResp := *resp
 		cacheResp.Header = maps.Clone(resp.Header)
 
-		// Inject fake X-Varied-<header> "response" headers
-		varyHeaders, err := parseVaryHeaders(resp.Header)
-		// Only cache if the Vary header is not *
-		if err == nil {
-			for _, header := range varyHeaders {
-				if vals := req.Header.Values(header); len(vals) > 0 {
-					if header == "Authorization" {
-						vals = []string{gh_hash_token.HashToken(vals[0])} // Don't leak/cache the raw authentication token
-					}
-					cacheResp.Header["X-Varied-"+header] = vals
-				}
-			}
+		// Remove excluded headers from the cached response
+		for _, header := range ExcludedCacheHeaders {
+			cacheResp.Header.Del(header)
+		}
 
-			// Store the cached response body as bytes
-			// Per the storage contract, they will restore the Body/ContentLength after consumption
-			if err := t.storage.Put(req.Context(), &cacheResp); err != nil {
-				return resp, fmt.Errorf("(Storage).Put failed: %w", err)
-			}
+		// Store the cached response body as bytes
+		// Per the storage contract, they will restore the Body/ContentLength after consumption
+		if err := t.storage.Put(req.Context(), req, &cacheResp); err != nil {
+			return resp, fmt.Errorf("(Storage).Put failed: %w", err)
 		}
 
 		// Restore the copied response body with the cached body
