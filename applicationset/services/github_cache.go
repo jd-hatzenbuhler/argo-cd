@@ -485,11 +485,16 @@ func NewGitHubCacheTransport(parent http.RoundTripper, cacheCtx *GitHubCacheCont
 // NewGitHubCacheFrom returns a new http.Client wrapping the provided one with cache middleware
 func NewGitHubCacheFrom(httpClient *http.Client, cacheCtx *GitHubCacheContext, size int) *http.Client {
 	log.Debug("Creating new GitHub cache")
-	httpClientCopy := *httpClient
-	transport := httpClient.Transport
-	if transport == nil {
+	var transport http.RoundTripper
+	if httpClient != nil && httpClient.Transport != nil {
+		transport = httpClient.Transport
+	} else {
 		transport = http.DefaultTransport
 	}
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+	httpClientCopy := *httpClient
 	httpClientCopy.Transport = NewGitHubCacheTransport(transport, cacheCtx, size)
 	return &httpClientCopy
 }
